@@ -3,9 +3,9 @@
 # ==============================================================================
 
 suppressPackageStartupMessages({
-  if (!requireNamespace("rstudioapi", quietly=TRUE)) install.packages("rstudioapi")
-  if (!requireNamespace("svDialogs", quietly=TRUE)) install.packages("svDialogs")
-  if (!requireNamespace("data.table", quietly=TRUE)) install.packages("data.table")
+    if (!requireNamespace("rstudioapi", quietly=TRUE)) install.packages("rstudioapi")
+    if (!requireNamespace("svDialogs", quietly=TRUE)) install.packages("svDialogs")
+    if (!requireNamespace("data.table", quietly=TRUE)) install.packages("data.table")
 })
 
 library(rstudioapi)
@@ -20,9 +20,9 @@ cat("=== שלב 2: מצב טורבו (data.table) ===\n\n")
 
 # ===== 1. הגדרות =====
 if (exists("output_dir")) {
-  project_dir <- output_dir
+    project_dir <- output_dir
 } else {
-  project_dir <- rstudioapi::selectDirectory(caption = "בחר את תיקיית הפרויקט")
+    project_dir <- rstudioapi::selectDirectory(caption = "בחר את תיקיית הפרויקט")
 }
 
 bpe_dir <- file.path(project_dir, "bpe_encoded")
@@ -36,7 +36,15 @@ res_w <- dlg_input("גודל חלון:", default = 40)$res
 res_m <- dlg_input("מינימום טוקנים:", default = 10)$res
 
 WINDOW_SIZE <- as.integer(if(length(res_w)) res_w else 40)
-MIN_TOKENS <- as.integer(if(length(res_m)) res_m else 10)
+MIN_TOKENS  <- as.integer(if(length(res_m)) res_m else 10)
+
+# חפיפת טוקנים מינימלית בין חלונות באשכול
+res_o <- dlg_input("חפיפת טוקנים מינימלית בין חלונות באשכול (למשל 3):", default = 3)$res
+MIN_CLUSTER_OVERLAP <- as.integer(if(length(res_o)) res_o else 3)
+
+# כמה חלונות באשכול ייחשבו 'גדולים' לבדיקה ידנית?
+res_c <- dlg_input("כמה חלונות באשכול ייחשבו 'גדולים' לבדיקה ידנית? (למשל 30):", default = 30)$res
+MAX_WINDOWS_PER_CLUSTER <- as.integer(if(length(res_c)) res_c else 30)
 
 # תיקיית תוצאות
 source_name <- file_path_sans_ext(basename(source_file))
@@ -44,23 +52,36 @@ run_id <- sprintf("%s_W%d_M%d_Turbo", source_name, WINDOW_SIZE, MIN_TOKENS)
 results_dir <- file.path(project_dir, paste0("results_", run_id))
 if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
 
+# קובץ לדוח אשכולות חשודים
+suspicious_path <- file.path(results_dir, "suspicious_clusters.csv")
+if (!file.exists(suspicious_path)) {
+    fwrite(
+        data.table(
+            target_file    = character(),
+            cluster_start  = integer(),
+            cluster_end    = integer(),
+            num_windows    = integer(),
+            max_overlap    = integer()
+        ),
+        suspicious_path
+    )
+}
+
 # ===== 2. טעינת מקור =====
 config_file <- file.path(project_dir, "config_bpe.rds")
 BPE_SEP <- if(file.exists(config_file)) readRDS(config_file)$bpe_sep else "\u25AA"
 
 read_tokens_fast <- function(path) {
-  # קריאה מהירה מאוד
-  con <- file(path, open = "rb")
-  sz <- file.info(path)$size
-  if (is.na(sz) || sz == 0) { close(con); return(character(0)) }
-  txt <- rawToChar(readBin(con, "raw", n = sz))
-  close(con)
-  unlist(strsplit(txt, BPE_SEP, fixed = TRUE))
+    con <- file(path, open = "rb")
+    sz <- file.info(path)$size
+    if (is.na(sz) || sz == 0) { close(con); return(character(0)) }
+    txt <- rawToChar(readBin(con, "raw", n = sz))
+    close(con)
+    unlist(strsplit(txt, BPE_SEP, fixed = TRUE))
 }
 
 cat("› טוען מקור... ")
 source_tokens <- read_tokens_fast(source_file)
-# יצירת Hash Table מהיר לחיפוש
 source_set <- unique(source_tokens[source_tokens != ""])
 source_lookup <- data.table(token = source_set, key = "token")
 cat(sprintf("✓ (%d טוקנים)\n", nrow(source_lookup)))
@@ -69,101 +90,172 @@ cat(sprintf("✓ (%d טוקנים)\n", nrow(source_lookup)))
 all_targets <- list.files(bpe_dir, pattern = "\\.txt$", full.names = TRUE, recursive = TRUE)
 all_targets <- all_targets[normalizePath(all_targets) != normalizePath(source_file)]
 
-BATCH_SIZE <- 50 # אפשר להגדיל חזרה כי העיבוד יעיל יותר
+BATCH_SIZE <- 50
 batches <- split(all_targets, ceiling(seq_along(all_targets) / BATCH_SIZE))
 total_batches <- length(batches)
 
+# חישוב נקודת התחלה באופן בטוח
 done_files <- list.files(results_dir, pattern = "batch_.*_results\\.rds$")
-done_ids <- as.integer(gsub("batch_|_results\\.rds", "", done_files))
-start_batch <- if(length(done_ids) > 0) max(done_ids) + 1 else 1
+if (length(done_files) > 0) {
+    done_ids <- as.integer(gsub("batch_|_results\\.rds", "", done_files))
+    start_batch <- max(done_ids, na.rm = TRUE) + 1L
+} else {
+    start_batch <- 1L
+}
 
 cat(sprintf("\n🚀 מתחיל הרצה טורבו: %d אצוות...\n", total_batches))
 
-for (b_idx in start_batch:total_batches) {
-  batch_files <- batches[[b_idx]]
-  
-  # טעינת כל האצווה לרשימה אחת (במקום לולאה איטית)
-  cat(sprintf("[Batch %d/%d] קורא קבצים... ", b_idx, total_batches))
-  
-  # שימוש ב-lapply מהיר
-  batch_data <- lapply(batch_files, function(f) {
-    toks <- read_tokens_fast(f)
-    if (length(toks) < MIN_TOKENS) return(NULL)
-    list(file = basename(f), tokens = toks)
-  })
-  
-  # סינון NULL
-  batch_data <- batch_data[!sapply(batch_data, is.null)]
-  
-  results_list <- list()
-  
-  if (length(batch_data) > 0) {
-    cat("מעבד... ")
-    
-    for (item in batch_data) {
-      t_tokens <- item$tokens
-      n <- length(t_tokens)
-      
-      # סינון מקדים מהיר בטירוף באמצעות match
-      # בודקים כמה טוקנים בקובץ קיימים במקור (פעולה וקטורית)
-      matches_idx <- which(t_tokens %in% source_set)
-      
-      if (length(matches_idx) < MIN_TOKENS) next
-      
-      # אם עבר סינון, רצים עם חלון רק סביב האזורים שיש בהם התאמות
-      # (אופטימיזציה: לא בודקים אזורים ריקים)
-      
-      # בניית מטריצת חלונות (Rolling Window)
-      starts <- 1:(n - WINDOW_SIZE + 1)
-      
-      # לולאה פנימית ב-C++ (באמצעות RcppRoll אם היה אפשר, אבל כאן נשתמש בלולאה פשוטה אך מהירה על וקטורים לוגיים)
-      # הטריק: להפוך את הטקסט לוקטור בוליאני (0/1) איפה שיש התאמה
-      is_match <- as.integer(t_tokens %in% source_set)
-      
-      # חישוב סכום רץ (Running Sum) - זה הסוד למהירות!
-      # במקום לבדוק חלון-חלון, מחשבים סכום מצטבר
-      cs <- cumsum(is_match)
-      # הסכום בחלון הוא: cs[end] - cs[start-1]
-      
-      # וקטור של סכומים בכל החלונות בבת אחת!
-      window_sums <- cs[WINDOW_SIZE:n] - c(0, cs[1:(n-WINDOW_SIZE)])
-      
-      # מוצאים את האינדקסים שעוברים את הסף
-      valid_starts <- which(window_sums >= MIN_TOKENS)
-      
-      if (length(valid_starts) > 0) {
-        # חילוץ התוצאות רק עבור החלונות הטובים
-        file_res <- lapply(valid_starts, function(s) {
-          e <- s + WINDOW_SIZE - 1
-          win <- t_tokens[s:e]
-          shared <- unique(win[win %in% source_set])
-          list(
-            target_file = item$file,
-            window_start = s,
-            window_end = e,
-            overlap_count = window_sums[s], # כבר חישבנו!
-            shared_tokens = paste(shared, collapse = " ")
-          )
+if (start_batch > total_batches) {
+    cat("אין אצוות חדשות לעיבוד.\n")
+} else {
+    for (b_idx in start_batch:total_batches) {
+        batch_files <- batches[[b_idx]]
+        
+        cat(sprintf("[Batch %d/%d] קורא קבצים... ", b_idx, total_batches))
+        
+        batch_data <- lapply(batch_files, function(f) {
+            toks <- read_tokens_fast(f)
+            if (length(toks) < MIN_TOKENS) return(NULL)
+            list(file = basename(f), tokens = toks)
         })
-        results_list <- c(results_list, file_res)
-      }
+        batch_data <- batch_data[!sapply(batch_data, is.null)]
+        
+        results_list    <- list()
+        suspicious_list <- list()
+        
+        if (length(batch_data) > 0) {
+            cat("מעבד... ")
+            
+            for (item in batch_data) {
+                t_tokens <- item$tokens
+                n <- length(t_tokens)
+                
+                matches_idx <- which(t_tokens %in% source_set)
+                if (length(matches_idx) < MIN_TOKENS) next
+                
+                is_match <- as.integer(t_tokens %in% source_set)
+                cs <- cumsum(is_match)
+                window_sums <- cs[WINDOW_SIZE:n] - c(0, cs[1:(n-WINDOW_SIZE)])
+                
+                valid_starts <- which(window_sums >= MIN_TOKENS)
+                if (length(valid_starts) == 0) next
+                
+                dt_win <- data.table(
+                    target_file   = item$file,
+                    window_start  = valid_starts,
+                    window_end    = valid_starts + WINDOW_SIZE - 1L,
+                    overlap_count = window_sums[valid_starts]
+                )
+                setorder(dt_win, window_start)
+                if (nrow(dt_win) == 0) next
+                
+                # איחוד חלונות לאשכולות
+                clusters <- dt_win[, {
+                    ws <- window_start
+                    we <- window_end
+                    oc <- overlap_count
+                    
+                    cl_start <- integer()
+                    cl_end   <- integer()
+                    cl_max   <- integer()
+                    cl_nwin  <- integer()
+                    
+                    cur_s <- ws[1]
+                    cur_e <- we[1]
+                    cur_m <- oc[1]
+                    cur_n <- 1L
+                    
+                    if (.N > 1L) {
+                        for (i in 2:.N) {
+                            ov_len <- min(cur_e, we[i]) - max(cur_s, ws[i]) + 1L
+                            if (ov_len >= MIN_CLUSTER_OVERLAP) {
+                                cur_e <- max(cur_e, we[i])
+                                cur_m <- max(cur_m, oc[i])
+                                cur_n <- cur_n + 1L
+                            } else {
+                                cl_start <- c(cl_start, cur_s)
+                                cl_end   <- c(cl_end,   cur_e)
+                                cl_max   <- c(cl_max,   cur_m)
+                                cl_nwin  <- c(cl_nwin,  cur_n)
+                                
+                                cur_s <- ws[i]
+                                cur_e <- we[i]
+                                cur_m <- oc[i]
+                                cur_n <- 1L
+                            }
+                        }
+                    }
+                    cl_start <- c(cl_start, cur_s)
+                    cl_end   <- c(cl_end,   cur_e)
+                    cl_max   <- c(cl_max,   cur_m)
+                    cl_nwin  <- c(cl_nwin,  cur_n)
+                    
+                    data.table(
+                        cluster_start  = cl_start,
+                        cluster_end    = cl_end,
+                        max_overlap    = cl_max,
+                        num_windows    = cl_nwin
+                    )
+                }, by = target_file]
+                
+                if (nrow(clusters) > 0) {
+                    clusters[, `:=`(
+                        shared_tokens = vapply(
+                            seq_len(.N),
+                            function(i) {
+                                s <- cluster_start[i]
+                                e <- cluster_end[i]
+                                s_win <- s
+                                e_win <- min(s + WINDOW_SIZE - 1L, e)
+                                win <- t_tokens[s_win:e_win]
+                                shared <- unique(win[win %in% source_set])
+                                paste(shared, collapse = " ")
+                            },
+                            FUN.VALUE = character(1)
+                        )
+                    )]
+                    
+                    res_dt <- clusters[, .(
+                        target_file   = target_file,
+                        window_start  = cluster_start,
+                        window_end    = cluster_end,
+                        overlap_count = max_overlap,
+                        shared_tokens = shared_tokens
+                    )]
+                    results_list <- c(results_list, list(res_dt))
+                    
+                    susp_dt <- clusters[num_windows >= MAX_WINDOWS_PER_CLUSTER,
+                                        .(target_file,
+                                          cluster_start,
+                                          cluster_end,
+                                          num_windows,
+                                          max_overlap)]
+                    if (nrow(susp_dt) > 0) {
+                        suspicious_list <- c(suspicious_list, list(susp_dt))
+                    }
+                }
+            }
+        }
+        
+        save_path <- file.path(results_dir, sprintf("batch_%04d_results.rds", b_idx))
+        
+        if (length(results_list) > 0) {
+            out_df <- rbindlist(results_list, use.names = TRUE, fill = TRUE)
+            saveRDS(out_df, save_path)
+            cat(sprintf("✓ %d התאמות (אשכולות).\n", nrow(out_df)))
+        } else {
+            saveRDS(data.frame(), save_path)
+            cat("✓ 0 התאמות.\n")
+        }
+        
+        if (length(suspicious_list) > 0) {
+            susp_all <- rbindlist(suspicious_list, use.names = TRUE, fill = TRUE)
+            fwrite(susp_all, suspicious_path, append = TRUE)
+        }
+        
+        rm(batch_data, results_list, suspicious_list)
+        gc(verbose=FALSE)
     }
-  }
-  
-  # שמירה
-  save_path <- file.path(results_dir, sprintf("batch_%04d_results.rds", b_idx))
-  
-  if (length(results_list) > 0) {
-    out_df <- rbindlist(results_list) # מהיר פי 100 מ-do.call(rbind)
-    saveRDS(out_df, save_path)
-    cat(sprintf("✓ %d התאמות.\n", nrow(out_df)))
-  } else {
-    saveRDS(data.frame(), save_path)
-    cat("✓ 0 התאמות.\n")
-  }
-  
-  rm(batch_data, results_list)
-  gc(verbose=FALSE)
 }
 
 cat("\n🏁 סיימנו!\n")
