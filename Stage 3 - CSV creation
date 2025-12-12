@@ -6,7 +6,7 @@ suppressPackageStartupMessages({
 setDTthreads(parallel::detectCores() - 1)
 gc()
 
-cat("=== שלב 3: כתיבה ישירה ל-CSV (ללא טבלה ענקית בזיכרון) ===\n\n")
+cat("=== שלב 3: כתיבה ישירה ל-CSV (אשכולות) ===\n\n")
 
 # 1. בחירת תיקיית התוצאות משלב 2
 if (exists("results_dir") && dir.exists(results_dir)) {
@@ -23,76 +23,75 @@ if (!length(rds_files)) stop("לא נמצאו קבצי batch_*.rds")
 
 cat(sprintf("🚀 נמצאו %d קבצי אצווה.\n", length(rds_files)))
 
-# 2. נגדיר נתיבי CSV סופיים
-csv_all   <- file.path(target_dir, "all_matches.csv")
-csv_sum   <- file.path(target_dir, "summary.csv")
+# 2. נתיבי CSV סופיים
+csv_all <- file.path(target_dir, "all_matches.csv")
+csv_sum <- file.path(target_dir, "summary.csv")
 
-# אם קיימים מקודם – נמחוק, כדי להתחיל נקי
 if (file.exists(csv_all)) file.remove(csv_all)
 if (file.exists(csv_sum)) file.remove(csv_sum)
 
-# 3. נעבור על כל קובץ RDS, אחד-אחד, ונכתוב ל-CSV מיד (append)
+# 3. כתיבה מצטברת של כל האשכולות ל-CSV
 pb <- txtProgressBar(min = 0, max = length(rds_files), style = 3)
 
 for (i in seq_along(rds_files)) {
   dt <- readRDS(rds_files[i])
-  if (is.data.frame(dt) && nrow(dt) > 0) {
+  if (!is.null(dt) && nrow(dt) > 0) {
     setDT(dt)
 
-    # נוודא שיש עמודות בסיס
-    if (!"target_file" %in% names(dt)) dt[, target_file := ""]
-    if (!"window_start" %in% names(dt)) dt[, window_start := NA_integer_]
-    if (!"overlap_count" %in% names(dt)) dt[, overlap_count := NA_integer_]
+    # וידוא עמודות בסיס (מאשכולות של שלב 2)
+    if (!"target_file"   %in% names(dt)) dt[, target_file := ""]
+    if (!"window_start"  %in% names(dt)) dt[, window_start := NA_integer_]
+    if (!"window_end"    %in% names(dt)) dt[, window_end   := NA_integer_]
+    if (!"overlap_count" %in% names(dt)) dt[, overlap_count:= NA_integer_]
+    if (!"shared_tokens" %in% names(dt)) dt[, shared_tokens:= ""]
 
-    # כתיבה ל-CSV: אם הקובץ עוד לא קיים – נוסיף header, אם כן – append בלי header
-    fwrite(dt,
-           file   = csv_all,
-           append = file.exists(csv_all),
-           col.names = !file.exists(csv_all),
-           bom = FALSE)
+    # כתיבה ל-all_matches.csv (כל שורה = אשכול אחד)
+    fwrite(
+      dt,
+      file     = csv_all,
+      append   = file.exists(csv_all),
+      col.names= !file.exists(csv_all),
+      bom      = FALSE
+    )
   }
   setTxtProgressBar(pb, i)
   if (i %% 10 == 0) gc(verbose = FALSE)
 }
 close(pb)
-cat("\n✓ all_matches.csv נכתב בהצלחה (בכתיבה מצטברת, ללא טבלה ענקית בזיכרון).\n")
+cat("\n✓ all_matches.csv נכתב בהצלחה (אשכולות, בכתיבה מצטברת).\n")
 
-# 4. כעת מחשבים summary קטן בלבד, בלי לטעון הכל שוב
-cat("📊 מחשב summary לפי קובץ יעד (יעשה בזרם שני)...\n")
+# 4. חישוב summary לפי קובץ יעד (כמה אשכולות לכל target_file)
+cat("📊 מחשב summary לפי קובץ יעד (streaming)...\n")
 
-# נקרא את ה-CSV רק עם שתי עמודות: target_file, overlap_count
-# כדי לחסוך זיכרון – נקרא ב-chunks
-chunk_size <- 5e5  # חצי מיליון שורות בכל פעם
+chunk_size <- 5e5
 con <- file(csv_all, open = "r")
 header <- readLines(con, n = 1, warn = FALSE)
+if (!length(header)) stop("all_matches.csv ריק.")
 
-# נחלץ שמות עמודות
 cols <- strsplit(header, ",")[[1]]
-tf_idx <- match("target_file", cols)
+if (!"target_file" %in% cols || !"overlap_count" %in% cols) {
+  stop("לא נמצאו העמודות target_file / overlap_count ב-all_matches.csv")
+}
 
-# טבלת סיכום בזיכרון (קטנה)
+# טבלת סיכום קטנה
 sum_dt <- data.table(target_file = character(), matches = integer())
 
 repeat {
   lines <- readLines(con, n = chunk_size, warn = FALSE)
   if (!length(lines)) break
 
-  # נבנה data.table קטן מה-lines בעזרת fread על טקסט
   chunk_text <- paste(c(header, lines), collapse = "\n")
   chunk_dt <- fread(chunk_text, select = c("target_file", "overlap_count"))
 
-  # נספור כמה שורות לכל target_file
   tmp <- chunk_dt[, .(matches = .N), by = target_file]
-  # נאחד לסיכום הכללי
   sum_dt <- rbindlist(list(sum_dt, tmp))[,
     .(matches = sum(matches)), by = target_file]
 }
 
 close(con)
 
-# מיון ושמירה
 setorder(sum_dt, -matches)
 fwrite(sum_dt, csv_sum, bom = TRUE)
-cat("✓ summary.csv נשמר.\n")
+cat("✓ summary.csv נשמר (מספר אשכולות לכל target_file).\n")
 
-cat("\n🏁 שלב 3 (streaming) הסתיים בלי טבלה ענקית בזיכרון.\n")
+cat("\n🏁 שלב 3 (streaming) הסתיים.\n")
