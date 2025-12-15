@@ -1,0 +1,453 @@
+# ============================================================================
+# שלב 4: רשת ציטוטים יצירה → יצירה (מבוסס all_matches.csv)
+# ============================================================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(visNetwork)
+  library(htmlwidgets)
+  library(rstudioapi)
+})
+
+setDTthreads(parallel::detectCores() - 1)
+
+cat("═══════════════════════════════════════════════════════════════\n")
+cat("    שלב 4: רשת ציטוטים (works)\n")
+cat("═══════════════════════════════════════════════════════════════\n\n")
+
+# ----------------------------------------------------------------
+# 0. בחירת קובץ + שם מקור
+# ----------------------------------------------------------------
+csv_path <- rstudioapi::selectFile(
+  caption = "בחר all_matches.csv",
+  filter  = "CSV (*.csv)",
+  existing = TRUE
+)
+if (is.null(csv_path)) stop("❌ לא נבחר קובץ.")
+
+cat("✓ all_matches.csv:", basename(csv_path),
+    sprintf(" (%.1f MB)\n\n", file.size(csv_path) / 1024^2))
+
+source_name <- rstudioapi::showPrompt(
+  title   = "שם המקור",
+  message = "label לצומת המרכזי (למשל Josephus):",
+  default = "Josephus"
+)
+if (is.null(source_name) || !nzchar(source_name)) source_name <- "Source"
+cat("✓ מקור:", source_name, "\n\n")
+
+output_dir <- dirname(csv_path)
+
+# ----------------------------------------------------------------
+# 1. טעינה מלאה של האשכולות
+# ----------------------------------------------------------------
+cat("📖 טוען אשכולות מלאים...\n")
+
+dt_full <- fread(
+  csv_path,
+  encoding = "UTF-8",
+  showProgress = TRUE
+)
+
+n_rows    <- nrow(dt_full)
+n_targets <- uniqueN(dt_full$target_file)
+
+cat(sprintf("✓ %s אשכולות, %d works\n\n",
+            format(n_rows, big.mark = ","), n_targets))
+
+if (n_rows == 0L) stop("all_matches.csv ריק.")
+
+# ----------------------------------------------------------------
+# 2. סיכום לרמת work + מאפייני קשת
+# ----------------------------------------------------------------
+cat("📊 מסכם לפי target_file...\n")
+
+summary_dt <- dt_full[, .(
+  citation_count = .N,
+  total_overlap  = sum(overlap_count, na.rm = TRUE)
+), by = target_file]
+
+setorder(summary_dt, -citation_count)
+
+# קטגוריות
+summary_dt[, category := fifelse(
+  citation_count == 1, "1",
+  fifelse(citation_count == 2, "2",
+  fifelse(citation_count <= 4, "3–4",
+  fifelse(citation_count <= 6, "5–6",
+  fifelse(citation_count <= 8, "7–8", "9+")))))
+]
+
+# צבעים לקשתות
+summary_dt[, edge_color := fcase(
+  category == "1",   "#ADD8E6",
+  category == "2",   "#87CEEB",
+  category == "3–4", "#FFC87C",
+  category == "5–6", "#FFA559",
+  category == "7–8", "#FF7F50",
+  category == "9+",  "#FF6347"
+)]
+
+summary_dt[, edge_width := pmin(1 + (citation_count * 0.3), 5)]
+
+cat("✓ סיכום מוכן\n\n")
+
+# ----------------------------------------------------------------
+# 3. nodes - ללא label
+# ----------------------------------------------------------------
+cat("🎨 בונה nodes...\n")
+
+nodes <- data.frame(
+  id = c(source_name, summary_dt$target_file),
+  label = rep("", 1 + nrow(summary_dt)),
+  title = c(
+    paste0("<b>", source_name, "</b>"),
+    paste0("<b>", sub("\\.txt$", "", basename(summary_dt$target_file)), "</b><br>",
+           summary_dt$citation_count, " ציטוטים")
+  ),
+  group = c("source", rep("target", nrow(summary_dt))),
+  size = c(25, pmin(8 + summary_dt$citation_count * 0.5, 20)),
+  stringsAsFactors = FALSE
+)
+
+# ----------------------------------------------------------------
+# 4. edges
+# ----------------------------------------------------------------
+cat("🎯 בונה edges...\n")
+
+edges <- data.frame(
+  from = source_name,
+  to = summary_dt$target_file,
+  color = summary_dt$edge_color,
+  width = summary_dt$edge_width,
+  stringsAsFactors = FALSE
+)
+
+# ----------------------------------------------------------------
+# 5. יצירת HTML
+# ----------------------------------------------------------------
+cat("🕸️ יוצר רשת אינטראקטיבית...\n")
+
+# הכנת נתוני ציטוטים - הסרת קו תחתון
+citations_clean <- dt_full[, .(
+  target_file = target_file,
+  window_start = window_start,
+  window_end = window_end,
+  overlap_count = overlap_count,
+  shared_tokens = ifelse(is.na(shared_tokens) | shared_tokens == "", "", 
+                         gsub("_", " ", gsub('"', '\\\\"', as.character(shared_tokens))))
+)]
+
+# רשימת קבצים ל-dropdown
+target_files <- summary_dt[, .(
+  id = target_file,
+  label = sub("\\.txt$", "", basename(target_file)),
+  count = citation_count
+)]
+setorder(target_files, -count)
+
+# המרה ל-JSON
+citations_json <- jsonlite::toJSON(citations_clean, auto_unbox = FALSE, pretty = FALSE)
+nodes_json <- jsonlite::toJSON(nodes, auto_unbox = FALSE, pretty = FALSE)
+edges_json <- jsonlite::toJSON(edges, auto_unbox = FALSE, pretty = FALSE)
+target_files_json <- jsonlite::toJSON(target_files, auto_unbox = FALSE, pretty = FALSE)
+
+# בניית HTML בחלקים
+html_part1 <- paste0('<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>רשת ציטוטים: ', source_name, '</title>
+  <script src="https://unpkg.com/vis-network@9.1.2/dist/vis-network.min.js"></script>
+  <style>
+    body { margin: 0; padding: 0; overflow: hidden; font-family: Arial, sans-serif; }
+    h1 { text-align: center; padding: 15px; margin: 0; background: #f8f9fa; border-bottom: 2px solid #dee2e6; font-size: 22px; }
+    #network-container { display: flex; width: 100vw; height: calc(100vh - 60px); }
+    #network-graph { flex: 1; height: 100%; background: #ffffff; }
+    #citations-panel {
+      width: 450px; height: 100%; background: #f8f9fa;
+      border-left: 3px solid #dee2e6; overflow-y: auto; padding: 20px;
+      box-shadow: -3px 0 10px rgba(0,0,0,0.1);
+    }
+    .file-selector {
+      background: white;
+      padding: 15px;
+      margin-bottom: 20px;
+      border-radius: 6px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .file-selector label {
+      display: block;
+      font-weight: bold;
+      color: #2C3E50;
+      margin-bottom: 8px;
+      direction: rtl;
+    }
+    .file-selector select {
+      width: 100%;
+      padding: 8px;
+      border: 1px solid #dee2e6;
+      border-radius: 4px;
+      font-size: 13px;
+      direction: rtl;
+    }
+    .citation-item {
+      background: white; padding: 12px; margin-bottom: 10px;
+      border-radius: 6px; border-right: 4px solid #007bff;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    .citation-header { 
+      display: flex; 
+      justify-content: space-between; 
+      align-items: center; 
+      margin-bottom: 8px;
+    }
+    .citation-location { 
+      font-weight: bold; 
+      color: #495057; 
+      direction: ltr; 
+    }
+    .citation-badge { 
+      background: #007bff; 
+      color: white; 
+      padding: 4px 10px; 
+      border-radius: 12px; 
+      font-size: 11px; 
+      font-weight: bold; 
+    }
+    .citation-text { 
+      color: #495057; 
+      font-size: 13px; 
+      line-height: 1.7; 
+      direction: rtl; 
+      word-wrap: break-word; 
+      white-space: pre-wrap;
+    }
+    .panel-header { 
+      color: #2C3E50; 
+      font-size: 20px; 
+      font-weight: bold; 
+      margin: 0 0 10px 0; 
+      padding-bottom: 10px; 
+      border-bottom: 2px solid #dee2e6; 
+      direction: rtl; 
+    }
+    .panel-subtitle { 
+      color: #6c757d; 
+      font-size: 14px; 
+      margin: 0 0 20px 0; 
+      direction: rtl; 
+    }
+    .empty-message { 
+      color: #6c757d; 
+      text-align: center; 
+      padding: 40px 20px; 
+      direction: rtl; 
+    }
+  </style>
+</head>
+<body>
+  <h1>רשת ציטוטים: ', source_name, ' → ', n_targets, ' works</h1>
+  <div id="network-container">
+    <div id="network-graph"></div>
+    <div id="citations-panel">
+      <div class="file-selector">
+        <label>בחר קובץ להצגת ציטוטים:</label>
+        <select id="file-dropdown" onchange="onFileSelected()">
+          <option value="">-- בחר קובץ --</option>
+        </select>
+      </div>
+      <div id="citations-content">
+        <div class="empty-message">לחץ על צומת/קשת או בחר קובץ מהרשימה</div>
+      </div>
+    </div>
+  </div>
+  
+  <script>
+    try {
+      var allCitations = ', citations_json, ';
+      var nodesData = ', nodes_json, ';
+      var edgesData = ', edges_json, ';
+      var targetFiles = ', target_files_json, ';')
+
+html_part2 <- '
+      
+      // מילוי dropdown
+      var dropdown = document.getElementById("file-dropdown");
+      targetFiles.forEach(function(file) {
+        var option = document.createElement("option");
+        option.value = file.id;
+        option.text = file.label + " (" + file.count + " ציטוטים)";
+        dropdown.appendChild(option);
+      });
+      
+      var nodes = new vis.DataSet(nodesData);
+      var edges = new vis.DataSet(edgesData);
+      
+      var container = document.getElementById("network-graph");
+      var data = { nodes: nodes, edges: edges };
+      var options = {
+        nodes: {
+          borderWidth: 2,
+          borderWidthSelected: 3,
+          shape: "dot"
+        },
+        edges: {
+          arrows: { to: { enabled: false } },
+          smooth: { enabled: true, type: "continuous", roundness: 0.5 },
+          selectionWidth: 3
+        },
+        groups: {
+          source: {
+            color: {
+              background: "#5DADE2",
+              border: "#2E86C1",
+              highlight: { background: "#3498DB", border: "#1F618D" }
+            },
+            font: { size: 16, color: "#ffffff", bold: true }
+          },
+          target: {
+            color: {
+              background: "#85C1E9",
+              border: "#5DADE2",
+              highlight: { background: "#5DADE2", border: "#2E86C1" }
+            },
+            font: { size: 11, color: "#2C3E50" }
+          }
+        },
+        layout: {
+          improvedLayout: true,
+          randomSeed: 42
+        },
+        physics: {
+          enabled: true,
+          solver: "barnesHut",
+          barnesHut: {
+            gravitationalConstant: -8000,
+            centralGravity: 0.2,
+            springLength: 200,
+            springConstant: 0.02,
+            damping: 0.15,
+            avoidOverlap: 0.5
+          },
+          stabilization: { 
+            enabled: true, 
+            iterations: 2000,
+            updateInterval: 50,
+            fit: true
+          }
+        },
+        interaction: {
+          navigationButtons: true,
+          hover: true,
+          tooltipDelay: 100,
+          hideEdgesOnDrag: true,
+          zoomView: true,
+          dragView: true
+        }
+      };
+      
+      var network = new vis.Network(container, data, options);
+      
+      network.once("stabilizationIterationsDone", function() {
+        network.setOptions({ physics: false });
+        network.fit({ animation: { duration: 1000, easingFunction: "easeInOutQuad" } });
+      });
+      
+      function showCitations(targetFile) {
+        var citations = allCitations.filter(function(c) { return c.target_file === targetFile; });
+        var panel = document.getElementById("citations-content");
+        
+        document.getElementById("file-dropdown").value = targetFile;
+        network.selectNodes([targetFile]);
+        
+        if (!citations || citations.length === 0) {
+          panel.innerHTML = "<div class=\\"empty-message\\">לא נמצאו ציטוטים</div>";
+          return;
+        }
+        
+        var fileName = targetFile.split("/").pop().replace(".txt", "");
+        var html = "<h2 class=\\"panel-header\\">" + fileName + "</h2>";
+        html += "<p class=\\"panel-subtitle\\">סה\\"כ <strong style=\\"color:#007bff;\\">" + citations.length + "</strong> ציטוטים</p>";
+        
+        var maxShow = Math.min(citations.length, 100);
+        for (var i = 0; i < maxShow; i++) {
+          var c = citations[i];
+          html += "<div class=\\"citation-item\\">";
+          html += "<div class=\\"citation-header\\">";
+          html += "<span class=\\"citation-location\\">" + c.window_start + " – " + c.window_end + "</span>";
+          html += "<span class=\\"citation-badge\\">overlap: " + c.overlap_count + "</span>";
+          html += "</div>";
+          if (c.shared_tokens && c.shared_tokens.trim() !== "") {
+            var text = c.shared_tokens.length > 400 ? c.shared_tokens.substring(0, 400) + "..." : c.shared_tokens;
+            html += "<div class=\\"citation-text\\">" + text + "</div>";
+          }
+          html += "</div>";
+        }
+        
+        if (citations.length > 100) {
+          html += "<p style=\\"text-align:center; color:#6c757d; font-style:italic; margin-top:15px;\\">מוצגים 100 ציטוטים ראשונים מתוך " + citations.length + "</p>";
+        }
+        
+        panel.innerHTML = html;
+      }
+      
+      function onFileSelected() {
+        var selectedFile = document.getElementById("file-dropdown").value;
+        if (selectedFile) {
+          showCitations(selectedFile);
+        }
+      }
+      
+      network.on("selectEdge", function(params) {
+        if (params.edges.length > 0) {
+          var edge = edges.get(params.edges[0]);
+          if (edge && edge.to) showCitations(edge.to);
+        }
+      });
+      
+      network.on("selectNode", function(params) {
+        if (params.nodes.length > 0) {
+          var nodeId = params.nodes[0];
+          var hasCitations = allCitations.some(function(c) { return c.target_file === nodeId; });
+          if (hasCitations) {
+            showCitations(nodeId);
+          } else {
+            document.getElementById("citations-content").innerHTML = "<div class=\\"empty-message\\">זהו צומת המקור</div>";
+            document.getElementById("file-dropdown").value = "";
+          }
+        }
+      });
+      
+    } catch(err) {
+      console.error("Error:", err);
+      document.getElementById("network-graph").innerHTML = "<div style=\\"padding:50px;text-align:center;\\"><h2>שגיאה ביצירת הרשת</h2><p>" + err.message + "</p></div>";
+    }
+  </script>
+</body>
+</html>'
+
+html_content <- paste0(html_part1, html_part2)
+
+out_html <- file.path(output_dir, "network_works.html")
+writeLines(html_content, out_html, useBytes = TRUE)
+
+cat("✓ נשמר:", basename(out_html), "\n")
+
+# ----------------------------------------------------------------
+# 6. summary CSV
+# ----------------------------------------------------------------
+out_csv <- file.path(output_dir, "summary_works.csv")
+fwrite(
+  summary_dt[, .(
+    target_file,
+    citation_count,
+    total_overlap,
+    category
+  )],
+  out_csv,
+  bom = TRUE
+)
+
+cat("✓ נשמר:", basename(out_csv), "\n")
+cat("🏁 שלב 4 הושלם.\n")
