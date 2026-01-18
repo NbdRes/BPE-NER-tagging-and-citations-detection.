@@ -1,188 +1,131 @@
-
-suppressPackageStartupMessages({
+suppressWarnings({
   if (!requireNamespace("rstudioapi", quietly=TRUE)) install.packages("rstudioapi")
-  if (!requireNamespace("dplyr", quietly=TRUE)) install.packages("dplyr")
-  if (!requireNamespace("data.table", quietly=TRUE)) install.packages("data.table") # לביצועים מהירים
+  if (!requireNamespace("sentencepiece", quietly=TRUE)) install.packages("sentencepiece")
 })
 
 library(rstudioapi)
-library(dplyr)
+library(sentencepiece)
 library(tools)
 
-cat("=== שלב 2: זיהוי התאמות (Set Intersection) ===\n\n")
+cat("=== שלב 0: אימון BPE וקידוד כל הקורפוס ===\n\n")
 
-# ===== 1. הגדרות ונתיבים =====
+# ===== 1. בחירת תיקיות =====
+input_dir <- rstudioapi::selectDirectory(caption = "בחר תיקיית קבצים מקוריים (טקסט יווני)")
+if (is.null(input_dir) || is.na(input_dir)) stop("לא נבחרה תיקייה.")
 
-# נסיון חכם לאתר את תיקיית הפרויקט (אם הרצת את שלב 1 הרגע)
-if (exists("output_dir")) {
-  project_dir <- output_dir
-} else {
-  project_dir <- rstudioapi::selectDirectory(caption = "בחר את תיקיית הפרויקט (התיקייה שבה נוצרו bpe_encoded וכו')")
+output_dir <- rstudioapi::selectDirectory(caption = "בחר תיקייה לשמירת תוצאות (תיקיית פרויקט)")
+if (is.null(output_dir) || is.na(output_dir)) stop("לא נבחרה תיקייה.")
+
+# יצירת תיקיות עבודה
+bpe_encoded_dir <- file.path(output_dir, "bpe_encoded")
+if (!dir.exists(bpe_encoded_dir)) dir.create(bpe_encoded_dir, recursive = TRUE)
+
+# ===== 2. פרמטרים =====
+BPE_SEP <- "\u25AA"  # ריבוע שחור
+VOCAB_SIZE <- 5000
+COVERAGE <- 0.9999
+
+cat(sprintf("✓ תיקיית קלט: %s\n", basename(input_dir)))
+cat(sprintf("✓ תיקיית פלט: %s\n", basename(output_dir)))
+cat(sprintf("✓ גודל אוצר מילים: %d\n", VOCAB_SIZE))
+cat(sprintf("✓ מפריד טוקנים: %s\n\n", BPE_SEP))
+
+# ===== 3. הכנת קורפוס לאימון =====
+cat("› אוסף קבצים לאימון BPE...\n")
+all_files <- list.files(input_dir, pattern = "\\.txt$", full.names = TRUE, recursive = TRUE)
+
+if (length(all_files) == 0) stop("❌ לא נמצאו קבצי .txt בתיקייה!")
+
+cat(sprintf("✓ נמצאו %d קבצים\n", length(all_files)))
+
+# יצירת קורפוס זמני לאימון
+temp_dir <- file.path(output_dir, ".temp_bpe")
+if (!dir.exists(temp_dir)) dir.create(temp_dir, recursive = TRUE)
+
+corpus_path <- file.path(temp_dir, "training_corpus.txt")
+model_name <- "greek_bpe"
+
+cat("› בונה קורפוס אימון...\n")
+corpus_con <- file(corpus_path, "w", encoding = "UTF-8")
+for (f in all_files) {
+  tryCatch({
+    content <- readLines(f, warn = FALSE, encoding = "UTF-8")
+    writeLines(content, corpus_con)
+  }, error = function(e) {
+    cat(sprintf("⚠ דילוג על %s: %s\n", basename(f), e$message))
+  })
 }
+close(corpus_con)
 
-bpe_dir <- file.path(project_dir, "bpe_encoded")
-if (!dir.exists(bpe_dir)) stop("❌ לא נמצאה תיקיית bpe_encoded! וודא שבחרת את התיקייה הנכונה.")
+cat(sprintf("✓ קורפוס נוצר: %s\n\n", basename(corpus_path)))
 
-# הגדרות ברירת מחדל (או טעינה מ-config אם קיים)
-config_file <- file.path(project_dir, "config_bpe.rds")
-if (file.exists(config_file)) {
-  config <- readRDS(config_file)
-  BPE_SEP <- config$bpe_sep
-} else {
-  BPE_SEP <- "\u25AA" # ברירת מחדל: ריבוע שחור
-}
+# ===== 4. אימון מודל BPE =====
+cat("🚀 מאמן מודל BPE...\n")
+cat("(זה יכול לקחת 10-30 דקות בהתאם לגודל הקורפוס)\n\n")
 
-# פרמטרים לחיפוש
-WINDOW_SIZE <- 50L      # גודל החלון בקובץ היעד
-MIN_TOKENS <- 5L        # מינימום טוקנים משותפים כדי להחשיב כהתאמה
-MIN_OVERLAP_PCT <- 20L  # אחוז חפיפה מינימלי
-BATCH_SIZE <- 200L      # גודל אצווה
-
-# ===== 2. בחירת קובץ המקור =====
-
-cat("\n--- בחירת טקסט מקור להשוואה ---\n")
-cat("ייפתח חלון לבחירת קובץ המקור (מתוך תיקיית bpe_encoded)...\n")
-
-source_file <- rstudioapi::selectFile(
-  caption = "בחר את קובץ המקור (הטקסט שאתה מחפש ציטוטים שלו)",
-  path = bpe_dir,
-  filter = "Text Files (*.txt)",
-  existing = TRUE
+sentencepiece(
+  x = corpus_path,
+  type = "bpe",
+  coverage = COVERAGE,
+  vocab_size = VOCAB_SIZE,
+  model_prefix = model_name,
+  model_dir = temp_dir,
+  verbose = FALSE
 )
 
-if (is.null(source_file) || is.na(source_file)) stop("לא נבחר קובץ מקור.")
+model_file <- file.path(temp_dir, paste0(model_name, ".model"))
+if (!file.exists(model_file)) stop("❌ המודל לא נוצר!")
 
-# יצירת תיקיית תוצאות ייעודית לקובץ הזה
-source_name <- file_path_sans_ext(basename(source_file))
-results_dir <- file.path(project_dir, paste0("results_setint_", source_name))
-if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+bpe_model <- sentencepiece_load_model(model_file)
+cat("\n✓ מודל BPE אומן בהצלחה!\n\n")
 
-cat(sprintf("✓ המקור נבחר: %s\n", source_name))
-cat(sprintf("✓ התוצאות יישמרו ב: %s\n", basename(results_dir)))
-
-# ===== 3. הכנת נתונים =====
-
-# פונקציית קריאה ופיצול
-read_and_split <- function(path) {
-  # קריאה בינארית מהירה
-  con <- file(path, open = "rb")
-  size <- file.info(path)$size
-  if (is.na(size) || size == 0) { close(con); return(character(0)) }
-  txt <- rawToChar(readBin(con, "raw", n = size))
-  close(con)
-  
-  # פיצול לפי המפריד
-  tokens <- unlist(strsplit(txt, BPE_SEP))
-  return(tokens[tokens != ""])
+# ===== 5. קידוד כל הקבצים =====
+convert_file_to_bpe <- function(input_path, output_path, model) {
+  tryCatch({
+    raw_text <- readLines(input_path, warn = FALSE, encoding = "UTF-8")
+    if (length(raw_text) == 0) return(NULL)
+    
+    full_text <- paste(raw_text, collapse = "\n")
+    tokens <- sentencepiece_encode(full_text, model = model)
+    
+    encoded_text <- paste(tokens, collapse = BPE_SEP)
+    writeLines(encoded_text, output_path, useBytes = TRUE)
+    
+  }, error = function(e) {
+    cat(sprintf("⚠ שגיאה בקובץ %s: %s\n", basename(input_path), e$message))
+  })
 }
 
-cat("› טוען את קובץ המקור לזיכרון... ")
-source_tokens <- read_and_split(source_file)
-source_set <- unique(source_tokens) # Set לחיפוש מהיר O(1)
-cat(sprintf("✓ (%d טוקנים ייחודיים)\n", length(source_set)))
+cat(sprintf("› מקודד %d קבצים...\n", length(all_files)))
 
-# רשימת קבצי יעד (כל התיקייה, למעט המקור עצמו)
-target_files <- list.files(bpe_dir, pattern = "\\.txt$", full.names = TRUE, recursive = TRUE)
-target_files <- target_files[normalizePath(target_files) != normalizePath(source_file)]
+# בדיקת קבצים שכבר עובדו (Resume)
+done_files <- list.files(bpe_encoded_dir, pattern = "\\.txt$", full.names = FALSE)
+target_files_todo <- all_files[!basename(all_files) %in% done_files]
 
-if (length(target_files) == 0) stop("לא נמצאו קבצים להשוואה!")
-
-# ===== 4. לוגיקת RESUME וניהול אצוות =====
-
-all_batches <- split(target_files, ceiling(seq_along(target_files) / BATCH_SIZE))
-total_batches <- length(all_batches)
-
-# בדיקה מה כבר בוצע
-done_files <- list.files(results_dir, pattern = "batch_.*_results\\.rds$")
-done_ids <- as.integer(gsub("batch_|_results\\.rds", "", done_files))
-
-if (length(done_ids) > 0) {
-  start_batch <- max(done_ids) + 1
-  cat(sprintf("✓ נמצאו %d אצוות מוכנות. ממשיך מאצווה %d...\n", length(done_ids), start_batch))
+if (length(target_files_todo) == 0) {
+  cat("✓ כל הקבצים כבר עובדו!\n")
 } else {
-  start_batch <- 1
-}
-
-if (start_batch > total_batches) {
-  cat("\n🎉 כל ההשוואות עבור קובץ זה כבר בוצעו!\nעבור לשלב 3 (איחוד תוצאות).\n")
-} else {
-
-  # ===== 5. לולאת העיבוד (Core Logic) =====
-  
-  cat("\n🚀 מתחיל סריקה והשוואה...\n")
-  global_start <- Sys.time()
-  
-  for (b_idx in start_batch:total_batches) {
-    batch_files_list <- all_batches[[b_idx]]
-    batch_results <- list()
-    
-    cat(sprintf("[Batch %d/%d | %d קבצים] ", b_idx, total_batches, length(batch_files_list)))
-    
-    # עיבוד מקבילי לא אפשרי בקלות ב-RStudio רגיל ללא חבילות מורכבות, 
-    # אז נשתמש בלולאה רגילה אך יעילה.
-    
-    hits_in_batch <- 0
-    
-    for (f_path in batch_files_list) {
-      t_tokens <- read_and_split(f_path)
-      n_tokens <- length(t_tokens)
-      
-      if (n_tokens < MIN_TOKENS) next
-      
-      # --- לוגיקת Sliding Window ---
-      # אנו עוברים על קובץ היעד בחלונות
-      # כדי לייעל: נבדוק קודם אם יש בכלל חפיפה גלובלית מינימלית
-      intersect_global <- length(intersect(unique(t_tokens), source_set))
-      if (intersect_global < MIN_TOKENS) next 
-      
-      # אם יש פוטנציאל, רצים עם חלון
-      starts <- seq(1, max(1, n_tokens - WINDOW_SIZE + 1), by = 1)
-      
-      for (s in starts) {
-        e <- min(s + WINDOW_SIZE - 1, n_tokens)
-        window <- t_tokens[s:e]
-        
-        # בדיקה מהירה
-        shared <- window[window %in% source_set]
-        cnt <- length(shared)
-        
-        if (cnt >= MIN_TOKENS) {
-          pct <- (cnt / length(window)) * 100
-          if (pct >= MIN_OVERLAP_PCT) {
-            # נמצאה התאמה!
-            rel_name <- get_safe_relative_path(f_path, bpe_dir) # שימוש באותה לוגיקה משלב 1 אם הוגדרה, או basename
-            if(!exists("get_safe_relative_path")) rel_name <- sub(paste0("^", bpe_dir, "/"), "", f_path)
-
-            batch_results[[length(batch_results) + 1]] <- data.frame(
-              target_file = rel_name,
-              window_start = s,
-              window_end = e,
-              overlap_count = cnt,
-              overlap_pct = round(pct, 1),
-              shared_tokens = paste(unique(shared), collapse = " "),
-              stringsAsFactors = FALSE
-            )
-          }
-        }
-      }
-    }
-    
-    # שמירת תוצאות האצווה
-    if (length(batch_results) > 0) {
-      final_df <- do.call(rbind, batch_results)
-      hits_in_batch <- nrow(final_df)
-      saveRDS(final_df, file.path(results_dir, sprintf("batch_%04d_results.rds", b_idx)))
-    } else {
-      # שומרים קובץ ריק כדי לסמן שהאצווה בוצעה (חשוב ל-Resume!)
-      saveRDS(data.frame(), file.path(results_dir, sprintf("batch_%04d_results.rds", b_idx)))
-    }
-    
-    # סטטוס
-    elapsed <- difftime(Sys.time(), global_start, units = "mins")
-    pct_done <- round(100 * b_idx / total_batches, 1)
-    cat(sprintf("✓ נשמר (%d התאמות). %.1f%%\n", hits_in_batch, pct_done))
+  pb <- txtProgressBar(min = 0, max = length(target_files_todo), style = 3)
+  for (i in seq_along(target_files_todo)) {
+    out_path <- file.path(bpe_encoded_dir, basename(target_files_todo[i]))
+    convert_file_to_bpe(target_files_todo[i], out_path, bpe_model)
+    setTxtProgressBar(pb, i)
   }
-  
-  cat("\n🏁 סיימנו את שלב 2!\n")
-  cat(sprintf("כל התוצאות שמורות בתיקייה: %s\n", basename(results_dir)))
+  close(pb)
 }
+
+# ===== 6. שמירת קונפיגורציה =====
+config <- list(
+  bpe_sep = BPE_SEP,
+  vocab_size = VOCAB_SIZE,
+  coverage = COVERAGE,
+  model_file = model_file,
+  input_dir = input_dir,
+  bpe_encoded_dir = bpe_encoded_dir
+)
+saveRDS(config, file.path(output_dir, "config_bpe.rds"))
+
+cat("\n\n🎉 שלב 0 הושלם בהצלחה!\n")
+cat(sprintf("📁 קבצים מקודדים נשמרו ב: %s\n", basename(bpe_encoded_dir)))
+cat(sprintf("⚙️ קונפיגורציה נשמרה: config_bpe.rds\n"))
+cat("\n>>> עכשיו אפשר להריץ את שלב 2 (זיהוי התאמות)\n")
